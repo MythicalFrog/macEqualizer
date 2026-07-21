@@ -1,0 +1,5 @@
+[apps.macEqualizer]
+identifier = "com.yourname.macEqualizer"
+product = "macEqualizer"
+version = "0.1.0"
+minimum_macos_version = "13.0"
