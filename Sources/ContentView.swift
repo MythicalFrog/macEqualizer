@@ -167,18 +167,83 @@ struct AnalyzerPanel: View {
 struct EQCurveCanvas: View {
     @EnvironmentObject private var model: EqualizerModel
     @EnvironmentObject private var analyzer: AnalyzerEngine
+    @State private var draggingBandID: ParametricBand.ID?
+    @State private var canvasSize: CGSize = .zero
 
     var body: some View {
-        Canvas { context, size in
-            let rect = CGRect(origin: .zero, size: size)
-            drawGrid(in: rect, context: &context)
-            drawSpectrum(in: rect, context: &context)
-            drawZeroLine(in: rect, context: &context)
-            drawCurve(in: rect, context: &context)
-            drawNodes(in: rect, context: &context)
+        GeometryReader { geo in
+            Canvas { context, size in
+                let rect = CGRect(origin: .zero, size: size)
+                drawGrid(in: rect, context: &context)
+                drawSpectrum(in: rect, context: &context)
+                drawZeroLine(in: rect, context: &context)
+                drawCurve(in: rect, context: &context)
+                drawNodes(in: rect, context: &context)
+            }
+            .background(.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.08)))
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        let rect = CGRect(origin: .zero, size: geo.size)
+                        let location = gesture.location
+
+                        if let id = draggingBandID {
+                            updateBand(id: id, from: location, in: rect)
+                        } else if let nearest = findNearestBand(to: location, in: rect) {
+                            draggingBandID = nearest.id
+                            updateBand(id: nearest.id, from: location, in: rect)
+                        }
+                    }
+                    .onEnded { _ in
+                        draggingBandID = nil
+                    }
+            )
         }
-        .background(.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.08)))
+    }
+
+    private func findNearestBand(to point: CGPoint, in rect: CGRect) -> ParametricBand? {
+        var nearest: ParametricBand?
+        var minDist: CGFloat = 20
+        for band in model.activeBands where band.isEnabled {
+            let nodePoint = CGPoint(
+                x: xPosition(forFrequency: band.frequency, in: rect),
+                y: yPosition(forGain: analyzer.effectiveGain(for: band), in: rect)
+            )
+            let dist = hypot(point.x - nodePoint.x, point.y - nodePoint.y)
+            if dist < minDist {
+                minDist = dist
+                nearest = band
+            }
+        }
+        return nearest
+    }
+
+    private func updateBand(id: ParametricBand.ID, from point: CGPoint, in rect: CGRect) {
+        let frequency = frequencyFromX(point.x, in: rect)
+        let gain = gainFromY(point.y, in: rect)
+
+        if let idx = model.leftBands.firstIndex(where: { $0.id == id }) {
+            model.leftBands[idx].frequency = frequency
+            model.leftBands[idx].gain = gain
+        } else if let idx = model.rightBands.firstIndex(where: { $0.id == id }) {
+            model.rightBands[idx].frequency = frequency
+            model.rightBands[idx].gain = gain
+        }
+    }
+
+    private func frequencyFromX(_ x: CGFloat, in rect: CGRect) -> Double {
+        let minLog = log10(20.0)
+        let maxLog = log10(20_000.0)
+        let normalized = Double((x - rect.minX) / rect.width)
+        let clamped = max(0, min(1, normalized))
+        return pow(10, minLog + (maxLog - minLog) * clamped)
+    }
+
+    private func gainFromY(_ y: CGFloat, in rect: CGRect) -> Double {
+        let normalized = Double(1 - (y - rect.minY) / rect.height)
+        let clamped = max(0, min(1, normalized))
+        return -18 + 36 * clamped
     }
 
     private func drawGrid(in rect: CGRect, context: inout GraphicsContext) {
@@ -252,9 +317,12 @@ struct EQCurveCanvas: View {
                 x: xPosition(forFrequency: band.frequency, in: rect),
                 y: yPosition(forGain: analyzer.effectiveGain(for: band), in: rect)
             )
-            let nodeRect = CGRect(x: point.x - 6, y: point.y - 6, width: 12, height: 12)
+            let isDragging = band.id == draggingBandID
+            let nodeSize: CGFloat = isDragging ? 10 : 6
+            let ringSize: CGFloat = isDragging ? 4 : 2
+            let nodeRect = CGRect(x: point.x - nodeSize, y: point.y - nodeSize, width: nodeSize * 2, height: nodeSize * 2)
             context.fill(Path(ellipseIn: nodeRect), with: .color(band.isDynamic ? .orange : accent))
-            context.stroke(Path(ellipseIn: nodeRect.insetBy(dx: -2, dy: -2)), with: .color(.white.opacity(0.52)), lineWidth: 1)
+            context.stroke(Path(ellipseIn: nodeRect.insetBy(dx: -ringSize, dy: -ringSize)), with: .color(.white.opacity(isDragging ? 0.8 : 0.52)), lineWidth: isDragging ? 2 : 1)
         }
     }
 
@@ -454,7 +522,7 @@ struct VerticalGainFader: View {
             value: $band.gain,
             range: -18...18,
             step: 0.1,
-            tint: .orange
+            tint: .cyan
         )
     }
 }

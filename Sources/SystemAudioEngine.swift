@@ -217,8 +217,11 @@ final class SystemAudioEngine: ObservableObject {
 
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
-        try engine.start()
 
+        let outputFormat = engine.outputNode.inputFormat(forBus: 0)
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: outputFormat)
+
+        try engine.start()
         outputEngine = engine
         sourceNode = source
     }
