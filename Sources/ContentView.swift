@@ -61,12 +61,18 @@ struct ContentView: View {
         .onAppear {
             model.scanRunningApplications()
             model.syncAllRouteVolumes()
-            nowPlaying.start()
             systemAudio.monitor = { left, right in
                 analyzer.ingestLiveSamples(left: left, right: right, model: model)
             }
             analyzer.refresh(model: model)
             systemAudio.updateBands(model: model)
+        }
+        .onChange(of: model.isAutoEQEnabled) { enabled in
+            if enabled {
+                nowPlaying.start()
+            } else {
+                nowPlaying.stop()
+            }
         }
     }
 }
@@ -177,20 +183,35 @@ struct EQCurveCanvas: View {
 
     private func drawGrid(in rect: CGRect, context: inout GraphicsContext) {
         let gridColor = Color.white.opacity(0.08)
+        let labelColor = Color.white.opacity(0.45)
+        let labelFont = Font.system(size: 9, weight: .medium, design: .monospaced)
+
         for gain in stride(from: -18.0, through: 18.0, by: 6.0) {
             var path = Path()
             let y = yPosition(forGain: gain, in: rect)
             path.move(to: CGPoint(x: rect.minX, y: y))
             path.addLine(to: CGPoint(x: rect.maxX, y: y))
             context.stroke(path, with: .color(gridColor), lineWidth: gain == 0 ? 1.2 : 0.7)
+
+            let label = gain == 0 ? "0" : "\(Int(gain))"
+            let text = Text(label).font(labelFont).foregroundColor(labelColor)
+            context.draw(text, at: CGPoint(x: rect.minX + 2, y: y - 7), anchor: .topLeading)
         }
 
-        for frequency in [20.0, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 20_000] {
+        let freqLabels: [(Double, String)] = [
+            (20, "20"), (50, "50"), (100, "100"), (250, "250"),
+            (500, "500"), (1000, "1k"), (2500, "2.5k"), (5000, "5k"),
+            (10_000, "10k"), (20_000, "20k")
+        ]
+        for (freq, label) in freqLabels {
             var path = Path()
-            let x = xPosition(forFrequency: frequency, in: rect)
+            let x = xPosition(forFrequency: freq, in: rect)
             path.move(to: CGPoint(x: x, y: rect.minY))
             path.addLine(to: CGPoint(x: x, y: rect.maxY))
             context.stroke(path, with: .color(gridColor), lineWidth: 0.7)
+
+            let text = Text(label).font(labelFont).foregroundColor(labelColor)
+            context.draw(text, at: CGPoint(x: x, y: rect.maxY - 2), anchor: .bottom)
         }
     }
 
@@ -327,15 +348,15 @@ struct BandCard: View {
     let onDelete: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
                 TextField("Node", text: $band.name)
                     .textFieldStyle(.plain)
                     .font(.headline)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Spacer()
+                    .minimumScaleFactor(0.7)
+                    .frame(minWidth: 40)
+                Spacer(minLength: 0)
                 PillToggle(isOn: $band.isEnabled)
                 Button(action: onDelete) {
                     Image(systemName: "trash")
@@ -345,33 +366,53 @@ struct BandCard: View {
                 .help("Delete node")
             }
 
-            HStack(alignment: .bottom, spacing: 18) {
+            HStack(alignment: .bottom, spacing: 12) {
                 VerticalFrequencyFader(band: $band)
                 VerticalGainFader(band: $band)
-                VStack(spacing: 10) {
+                VStack(spacing: 8) {
                     Picker("Shape", selection: $band.shape) {
                         ForEach(FilterShape.allCases) { shape in
                             Text(shape.rawValue).tag(shape)
                         }
                     }
                     .labelsHidden()
+                    .frame(maxWidth: .infinity)
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Q \(band.q, specifier: "%.1f")")
-                            .font(.caption.monospacedDigit())
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Q")
+                                .foregroundStyle(.secondary)
+                            Text("\(band.q, specifier: "%.1f")")
+                        }
+                        .font(.caption2.monospacedDigit())
+                        .lineLimit(1)
                         Slider(value: $band.q, in: 0.3...10, step: 0.1)
+                            .controlSize(.small)
                     }
 
                     Toggle("Dynamic", isOn: $band.isDynamic)
+                        .font(.caption)
 
                     if band.isDynamic {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Threshold \(band.threshold, specifier: "%.0f") dB")
-                                .font(.caption.monospacedDigit())
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Thresh")
+                                    .foregroundStyle(.secondary)
+                                Text("\(band.threshold, specifier: "%.0f")dB")
+                            }
+                            .font(.caption2.monospacedDigit())
+                            .lineLimit(1)
                             Slider(value: $band.threshold, in: -48...0, step: 1)
-                            Text("Ratio \(band.ratio, specifier: "%.1f"):1")
-                                .font(.caption.monospacedDigit())
+                                .controlSize(.small)
+                            HStack {
+                                Text("Ratio")
+                                    .foregroundStyle(.secondary)
+                                Text("\(band.ratio, specifier: "%.1f"):1")
+                            }
+                            .font(.caption2.monospacedDigit())
+                            .lineLimit(1)
                             Slider(value: $band.ratio, in: 1...8, step: 0.1)
+                                .controlSize(.small)
                         }
                     }
                 }
@@ -379,7 +420,7 @@ struct BandCard: View {
 
             CoefficientReadout(coefficients: analyzer.coefficients(for: band), effectiveGain: analyzer.effectiveGain(for: band))
         }
-        .padding(12)
+        .padding(10)
         .background(surface1, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(band.isDynamic ? .orange.opacity(0.25) : glassBorder))
     }
@@ -427,16 +468,16 @@ struct VerticalDragFader: View {
     let tint: Color
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             Text(valueText)
-                .font(.caption.monospacedDigit())
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .lineLimit(1)
-                .minimumScaleFactor(0.72)
-                .frame(width: 58, height: 18)
+                .minimumScaleFactor(0.7)
+                .frame(width: 52, height: 14)
 
             GeometryReader { geometry in
-                let trackWidth: CGFloat = 8
-                let knobSize: CGFloat = 22
+                let trackWidth: CGFloat = 6
+                let knobSize: CGFloat = 18
                 let fillHeight = geometry.size.height * progress
                 let knobY = geometry.size.height * (1 - progress)
 
@@ -452,7 +493,7 @@ struct VerticalDragFader: View {
                     Circle()
                         .fill(tint)
                         .frame(width: knobSize, height: knobSize)
-                        .shadow(color: tint.opacity(0.45), radius: 5)
+                        .shadow(color: tint.opacity(0.45), radius: 4)
                         .position(x: geometry.size.width / 2, y: knobY)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -464,13 +505,13 @@ struct VerticalDragFader: View {
                         }
                 )
             }
-            .frame(width: 58, height: 164)
+            .frame(width: 52, height: 150)
 
             Text(title)
-                .font(.caption2)
+                .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(.secondary)
         }
-        .frame(width: 58)
+        .frame(width: 52)
     }
 
     private var progress: CGFloat {
@@ -499,7 +540,7 @@ struct CoefficientReadout: View {
     let effectiveGain: Double
 
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
+        Grid(alignment: .leading, horizontalSpacing: 6, verticalSpacing: 2) {
             GridRow {
                 Text("eff").foregroundStyle(.secondary)
                 Text("\(effectiveGain, specifier: "%.2f")")
@@ -517,10 +558,12 @@ struct CoefficientReadout: View {
                 Text("\(coefficients.b2, specifier: "%.3f")")
             }
         }
-        .font(.caption2.monospacedDigit())
-        .padding(8)
+        .font(.system(size: 9, weight: .medium, design: .monospaced))
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
+        .padding(6)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(surface2, in: RoundedRectangle(cornerRadius: 8))
+        .background(surface2, in: RoundedRectangle(cornerRadius: 6))
     }
 }
 

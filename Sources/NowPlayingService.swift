@@ -1,6 +1,4 @@
 import AppKit
-import Foundation
-import MediaRemoteAdapter
 
 struct TrackInfo: Equatable {
     let title: String
@@ -16,248 +14,171 @@ struct TrackInfo: Equatable {
 final class NowPlayingService: ObservableObject {
     @Published var currentTrackInfo: TrackInfo?
 
-    private let mediaController = MediaController()
     private var lastKey: String = ""
-    private var debounceWorkItem: DispatchWorkItem?
-    private var lastSwitchTime: Date = .distantPast
-    private let cooldownSeconds: TimeInterval = 4.0
-
-    private var appleScriptTimer: Timer?
-    private var fallbackMode = false
+    private var pollTimer: Timer?
 
     @MainActor
     func start() {
-        mediaController.onTrackInfoReceived = { [weak self] remoteInfo in
-            self?.handleRemoteTrackInfo(remoteInfo)
-        }
-        mediaController.onListenerTerminated = { [weak self] in
-            DispatchQueue.main.async {
-                self?.enableAppleScriptFallback()
-            }
-        }
-        mediaController.startListening()
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            guard let self = self else { return }
-            if self.currentTrackInfo == nil && !self.fallbackMode {
-                self.enableAppleScriptFallback()
-            }
+        guard pollTimer == nil else { return }
+        checkNowPlaying()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.checkNowPlaying()
         }
     }
 
     @MainActor
     func stop() {
-        mediaController.stopListening()
-        appleScriptTimer?.invalidate()
-        appleScriptTimer = nil
-        debounceWorkItem?.cancel()
-        debounceWorkItem = nil
+        pollTimer?.invalidate()
+        pollTimer = nil
+        lastKey = ""
+        currentTrackInfo = nil
     }
 
-    // MARK: - MediaRemote (primary)
-
-    private func handleRemoteTrackInfo(_ remoteInfo: MediaRemoteAdapter.TrackInfo?) {
-        guard let remoteInfo = remoteInfo else {
-            debouncedUpdate(nil)
-            return
-        }
-
-        let payload = remoteInfo.payload
-        guard let title = payload.title, !title.isEmpty else {
-            debouncedUpdate(nil)
-            return
-        }
-        let artist = payload.artist ?? "Unknown Artist"
-        let album = payload.album ?? ""
-        let sourceApp = payload.applicationName ?? payload.bundleIdentifier ?? ""
-
-        let track = TrackInfo(title: title, artist: artist, album: album, sourceApp: sourceApp)
-        debouncedUpdate(track)
-    }
-
-    // MARK: - Debounce / cooldown
-
-    private func debouncedUpdate(_ track: TrackInfo?) {
-        debounceWorkItem?.cancel()
-
+    private func checkNowPlaying() {
+        let track = getFromSystemNowPlaying() ?? getFromAppleScript()
         if let track = track {
-            let key = track.cacheKey
-            guard key != lastKey else { return }
-
-            let now = Date()
-            let elapsed = now.timeIntervalSince(lastSwitchTime)
-            let delay = max(0, cooldownSeconds - elapsed)
-
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self else { return }
-                self.lastKey = key
-                self.lastSwitchTime = Date()
-                DispatchQueue.main.async {
-                    self.currentTrackInfo = track
-                }
-            }
-            debounceWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
-        } else if currentTrackInfo != nil {
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self else { return }
-                self.lastKey = ""
-                DispatchQueue.main.async {
-                    self.currentTrackInfo = nil
-                }
-            }
-            debounceWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: workItem)
-        }
-    }
-
-    // MARK: - AppleScript fallback
-
-    private func enableAppleScriptFallback() {
-        guard !fallbackMode else { return }
-        fallbackMode = true
-        mediaController.stopListening()
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.checkAppleScriptNowPlaying()
-            self.appleScriptTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-                self?.checkAppleScriptNowPlaying()
-            }
-        }
-    }
-
-    private func checkAppleScriptNowPlaying() {
-        if let track = getTrackFromSpotify() ?? getTrackFromMusic() ?? getTrackFromDynamicApps() {
             let key = track.cacheKey
             guard key != lastKey else { return }
             lastKey = key
             currentTrackInfo = track
+            log("detected: \(track.title) - \(track.artist) via \(track.sourceApp)")
         } else if currentTrackInfo != nil {
             currentTrackInfo = nil
             lastKey = ""
+            log("track cleared")
         }
     }
 
-    private func getTrackFromSpotify() -> TrackInfo? {
-        let script = """
-        tell application "Spotify"
-            if player state is playing then
-                set trackName to name of current track
-                set artistName to artist of current track
-                set albumName to album of current track
-                return trackName & "|" & artistName & "|" & albumName
-            end if
-        end tell
-        """
-        return runAppleScript(script, sourceApp: "Spotify")
-    }
+    // MARK: - System Now Playing (works for Safari, Chrome, Spotify, Music, etc.)
 
-    private func getTrackFromMusic() -> TrackInfo? {
-        let script = """
-        tell application "Music"
-            if player state is playing then
-                set trackName to name of current track
-                set artistName to artist of current track
-                set albumName to album of current track
-                return trackName & "|" & artistName & "|" & albumName
-            end if
-        end tell
-        """
-        return runAppleScript(script, sourceApp: "Music")
-    }
+    private func getFromSystemNowPlaying() -> TrackInfo? {
+        guard let cliPath = findCLI() else {
+            log("nowplaying-cli not found")
+            return nil
+        }
 
-    private func getTrackFromDynamicApps() -> TrackInfo? {
-        let candidates: [(String, String)] = [
-            ("YouTube Music", "YouTube Music"),
-            ("VLC", "VLC"),
-            ("IINA", "IINA"),
-            ("Spotify", "Spotify"),
-            ("Music", "Music"),
-        ]
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: cliPath)
+        task.arguments = ["get", "title", "artist", "album"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
 
-        let runningNames = Set(NSWorkspace.shared.runningApplications
-            .compactMap { $0.localizedName })
-
-        for (appName, _) in candidates {
-            guard runningNames.contains(appName) else { continue }
-            if let track = queryAppleScript(app: appName) {
-                return track
-            }
+        guard (try? task.run()) == nil else {
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return parseCLIOutput(output)
         }
         return nil
     }
 
-    private func queryAppleScript(app: String) -> TrackInfo? {
-        switch app {
-        case "Spotify":
-            return getTrackFromSpotify()
-        case "Music":
-            return getTrackFromMusic()
-        case "YouTube Music":
-            return runAppleScript("""
-            tell application "YouTube Music"
-                if player state is playing then
-                    set trackName to name of current track
-                    set artistName to artist of current track
-                    set albumName to album of current track
-                    return trackName & "|" & artistName & "|" & albumName
-                end if
-            end tell
-            """, sourceApp: "YouTube Music")
-        case "VLC":
-            return runAppleScript("""
-            tell application "VLC"
-                if playing then
-                    set trackName to name of current item
-                    set artistName to artist of current item
-                    set albumName to album of current item
-                    return trackName & "|" & artistName & "|" & albumName
-                end if
-            end tell
-            """, sourceApp: "VLC")
-        case "IINA":
-            return runAppleScript("""
-            tell application "IINA"
-                if playing then
-                    set trackName to name of current track
-                    set artistName to artist of current track
-                    set albumName to album of current track
-                    return trackName & "|" & artistName & "|" & albumName
-                end if
-            end tell
-            """, sourceApp: "IINA")
-        default:
-            return nil
+    private func parseCLIOutput(_ output: String) -> TrackInfo? {
+        let lines = output.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }
+        guard lines.count >= 2, !lines[0].isEmpty else { return nil }
+
+        let title = lines[0]
+        let artist = lines.count >= 2 ? lines[1] : "Unknown Artist"
+        let album = lines.count >= 3 ? lines[2] : ""
+
+        return TrackInfo(title: title, artist: artist, album: album, sourceApp: "Now Playing")
+    }
+
+    private func findCLI() -> String? {
+        let paths = [
+            "/opt/homebrew/bin/nowplaying-cli",
+            "/usr/local/bin/nowplaying-cli",
+            "/usr/bin/nowplaying-cli"
+        ]
+        return paths.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private func log(_ msg: String) {
+        let line = "[NowPlaying] \(msg)\n"
+        if let data = line.data(using: .utf8) {
+            let handle = FileHandle(forWritingAtPath: "/tmp/maceq_debug.log")
+            handle?.seekToEndOfFile()
+            handle?.write(data)
+            handle?.closeFile()
         }
+    }
+
+    // MARK: - AppleScript fallback (for apps that don't report to system center)
+
+    private func getFromAppleScript() -> TrackInfo? {
+        return getFromSpotify() ?? getFromMusic() ?? getFromYouTubeMusic() ?? getFromVLC()
+    }
+
+    private func getFromSpotify() -> TrackInfo? {
+        guard isAppRunning("Spotify") else { return nil }
+        return runAppleScript("""
+        tell application "Spotify"
+            if player state is playing then
+                return name of current track & "|" & artist of current track & "|" & album of current track
+            end if
+        end tell
+        """, sourceApp: "Spotify")
+    }
+
+    private func getFromMusic() -> TrackInfo? {
+        guard isAppRunning("Music") else { return nil }
+        return runAppleScript("""
+        tell application "Music"
+            if player state is playing then
+                return name of current track & "|" & artist of current track & "|" & album of current track
+            end if
+        end tell
+        """, sourceApp: "Music")
+    }
+
+    private func getFromYouTubeMusic() -> TrackInfo? {
+        guard isAppRunning("YouTube Music") else { return nil }
+        return runAppleScript("""
+        tell application "YouTube Music"
+            if player state is playing then
+                return name of current track & "|" & artist of current track & "|" & album of current track
+            end if
+        end tell
+        """, sourceApp: "YouTube Music")
+    }
+
+    private func getFromVLC() -> TrackInfo? {
+        guard isAppRunning("VLC") else { return nil }
+        return runAppleScript("""
+        tell application "VLC"
+            if playing then
+                return name of current item & "|" & artist of current item & "|" & album of current item
+            end if
+        end tell
+        """, sourceApp: "VLC")
+    }
+
+    // MARK: - Helpers
+
+    private func isAppRunning(_ name: String) -> Bool {
+        NSWorkspace.shared.runningApplications.contains { $0.localizedName == name }
     }
 
     private func runAppleScript(_ script: String, sourceApp: String) -> TrackInfo? {
         let appleScript = NSAppleScript(source: script)
         var error: NSDictionary?
         let result = appleScript?.executeAndReturnError(&error)
+        guard error == nil,
+              let value = result?.stringValue,
+              !value.isEmpty else { return nil }
 
-        if error != nil {
-            return nil
-        }
-
-        guard let stringValue = result?.stringValue, !stringValue.isEmpty else {
-            return nil
-        }
-
-        let parts = stringValue.split(separator: "|", maxSplits: 2).map(String.init)
+        let parts = value.split(separator: "|", maxSplits: 2).map(String.init)
         guard parts.count >= 2, !parts[0].isEmpty else { return nil }
 
-        let title = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
-        let artist = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
-        let album = parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-
-        return TrackInfo(title: title, artist: artist, album: album, sourceApp: sourceApp)
+        return TrackInfo(
+            title: parts[0].trimmingCharacters(in: .whitespacesAndNewlines),
+            artist: parts[1].trimmingCharacters(in: .whitespacesAndNewlines),
+            album: parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines) : "",
+            sourceApp: sourceApp
+        )
     }
 
     deinit {
-        mediaController.stopListening()
-        appleScriptTimer?.invalidate()
-        debounceWorkItem?.cancel()
+        pollTimer?.invalidate()
     }
 }

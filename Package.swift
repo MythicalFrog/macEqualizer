@@ -7,15 +7,9 @@ let package = Package(
     products: [
         .executable(name: "macEqualizer", targets: ["macEqualizer"])
     ],
-    dependencies: [
-        .package(url: "https://github.com/ejbills/mediaremote-adapter.git", branch: "master")
-    ],
     targets: [
         .executableTarget(
             name: "macEqualizer",
-            dependencies: [
-                .product(name: "MediaRemoteAdapter", package: "mediaremote-adapter")
-            ],
             path: "Sources"
         )
     ]
